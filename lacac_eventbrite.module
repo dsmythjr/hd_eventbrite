@@ -1,0 +1,301 @@
+<?php
+
+/**
+ * @file
+ * Custom Eventbrite Code
+ */
+
+
+
+/**
+ * Implements hook_menu().
+ */
+function hd_eventbrite_menu() {
+
+  $test_url = variable_get('eventbrite_url','module-test');
+
+  $items = array();
+
+  $items['admin/config/system/eventbrite'] = array(
+    'title' => 'Eventbrite Sync Settings',
+    'description' => 'Settings for the Eventbrite Sync',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('eventbrite_settings_form'),
+    'access arguments' => array('access administration pages'),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 10,
+  );
+
+  $items[$test_url] = array(
+    'title' => 'Module Test',
+    'description' => 'Module Test',
+    'page callback' => 'eventbrite_content',
+    'access callback' => TRUE,
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+function eventbrite_settings_form($form, &$form_state) {
+
+  $form['eventbrite_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Module Test URL'),
+    '#default_value' => variable_get('eventbrite_url'),
+    '#description' => t("Enter the URL that the module code can be tested from."),
+    '#required' => TRUE,
+  );
+
+  $form['eventbrite_access_token'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Eventbrite Access Token'),
+    '#default_value' => variable_get('eventbrite_access_token'),
+    '#description' => t("Enter the Eventbrite access token from the Eventbrite API app"),
+    '#required' => TRUE,
+  );
+
+  return system_settings_form($form);
+}
+
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function hd_eventbrite_cron_queue_info() {
+  $queues['eventbrite_pull_queue'] = array(
+      'worker callback' => 'eventbrite_pull_queue_worker',
+      'skip on cron' => FALSE,
+      'time' => 30,
+  );
+  $queues['eventbrite_update_queue'] = array(
+      'worker callback' => 'eventbrite_update_queue_worker',
+      'skip on cron' => FALSE,
+      'time' => 30,
+  );
+
+  return $queues;
+
+}
+
+/**
+ * Implements hook_cron().
+ */
+function hd_eventbrite_cron() {
+  $access_token = variable_get('eventbrite_access_token');
+  require 'eventbrite.php';
+  $eb_client = new Eventbrite( array('access_token' => $access_token));
+  $queue = new UniqueQueue('hd_eventbrite_event_pull');
+
+  // Get Event IDs from existing events
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'event')
+    //->propertyCondition('status', 0)
+    ->fieldCondition('field_eb_event_id', 'value', 'NULL', '!=')
+    ->addMetaData('account', user_load(1));
+  $results = $query->execute();
+  $current_ids = array();
+  if (isset($results['node'])) {
+     $stories = $results['node'];
+     $fields = field_info_instances('node', 'event');
+     $field_id = $fields['field_eb_event_id']['field_id'];
+     field_attach_load('node', $stories, FIELD_LOAD_CURRENT, array('field_id' => $field_id));
+     foreach ($results['node'] as $result) {
+       $current_ids[] = $result->field_eb_event_id[LANGUAGE_NONE][0]['value'];
+     }
+  }
+  try {
+    $events = $eb_client->user_list_events();
+    if (!empty($events)) {
+      watchdog('Eventbrite','Connected to Eventbrite - Syncing Events');
+    }
+  } catch ( Exception $e ) {
+      watchdog('Eventbrite','Could Not Connect to Eventbrite');
+    return;
+  }
+
+    $event_list = json_decode(json_encode($events->events), true);
+    foreach($event_list as $event) {
+      $event_id = $event['event']['id'];
+      if (in_array($event_id,$current_ids)) {
+        // Update events that are already in the Drupal system
+          //DrupalQueue::get('eventbrite_update_queue')->createItem($event);
+        //return;
+      } else {
+        if ($event['event']['status'] == 'Live') {
+         DrupalQueue::get('eventbrite_pull_queue')->createItem($event);
+        }
+      }
+    }
+    return;
+}
+
+
+function eventbrite_pull_queue_worker($event) {
+  // Create the Drupal Node for eventbrite events
+  hd_eventbrite_event_pull($event);
+}
+
+function eventbrite_update_queue_worker($event) {
+  hd_eventbrite_event_update($event);
+}
+
+/**
+ * Worker callback for creating / updating a syndicated event.
+ */
+function hd_eventbrite_event_pull($event) {
+  global $user;
+  if ($event['event']['status'] == 'Live') {
+    $node = new stdClass();
+    $node->type = 'event';
+    node_object_prepare($node);
+    $node->language = LANGUAGE_NONE;
+    $node->title = $event['event']['title'];
+    $node->uid = 1;
+    $node->status = 0;
+    $node->field_eb_event_id[LANGUAGE_NONE][0]['value'] = $event['event']['id'];
+    $node->field_dates[LANGUAGE_NONE][0]['value'] = $event['event']['start_date'];
+    $node->field_dates[LANGUAGE_NONE][0]['timezone'] = 'America/Los_Angeles';
+    $node->field_dates[LANGUAGE_NONE][0]['timezone_db'] = 'America/Los_Angeles';
+    $node->field_dates[LANGUAGE_NONE][0]['date_type'] = 'datetime';
+    $node->field_dates[LANGUAGE_NONE][0]['value2'] = $event['event']['end_date'];
+    $node->field_eb_modified[LANGUAGE_NONE][0]['value'] = $event['event']['modified'];
+    $node->body[LANGUAGE_NONE][0]['value'] = $event['event']['description'];
+    $node->body[LANGUAGE_NONE][0]['format'] = 'full_html';
+    $node->field_eb_url[LANGUAGE_NONE][0]['url'] = $event['event']['url'];
+    $node->field_event_link[LANGUAGE_NONE][0]['url'] = $event['event']['url'];
+    $node->field_eb_tickets_available[LANGUAGE_NONE][0]['value'] = $event['event']['tickets'][0]['ticket']['quantity_available'];
+    $node->field_eb_tickets_sold[LANGUAGE_NONE][0]['value'] = $event['event']['tickets'][0]['ticket']['quantity_sold'];
+    $node->field_eb_tickets_remaining[LANGUAGE_NONE][0]['value'] = (($event['event']['tickets'][0]['ticket']['quantity_available']) - ($event['event']['tickets'][0]['ticket']['quantity_sold']));
+    $ticket_info = '';
+    if (!empty($node->field_eb_tickets_available)) {
+      $price = '$' . $event['event']['tickets'][0]['ticket']['display_price'];
+      if ($event['event']['tickets'][0]['ticket']['display_price'] == 0.00) {
+        $free_tax_name = taxonomy_get_term_by_name('Free');
+        $free_tid = key($free_tax_name);
+        $node->field_price_level[LANGUAGE_NONE][0]['tid'] = $free_tid;
+        $price = 'Free';
+      }
+      $node->field_ticket_information[LANGUAGE_NONE][0]['value'] = strval($event['event']['tickets'][0]['ticket']['quantity_available'] . ' Tickets Available*<i>click on "Buy Tickets" for current availability.</i> <br>' . $price);
+      $node->field_ticket_information[LANGUAGE_NONE][0]['format'] = 'full_html';
+    }
+    node_save($node);
+  }
+}
+
+function hd_eventbrite_event_update($event) {
+
+  $event_id = $event['event']['id'];
+
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'event')
+    ->propertyCondition('status', 1)
+    ->fieldCondition('field_eb_event_id', 'value', $event_id, '=');
+  $results = $query->execute();
+  $nid = current($results['node'])->nid;
+  $node = node_load($nid);
+  $node_wrapper = entity_metadata_wrapper('node', $node);
+  $drupal_modified = $node_wrapper->field_eb_modified->value();
+  $drupal_tickets_avail = $node_wrapper->field_eb_tickets_sold->value();
+  $eb_available = $event['event']['tickets'][0]['ticket']['quantity_sold'];
+  $eb_modified = strtotime($event['event']['modified']);
+  if (($drupal_modified != $eb_modified) || ($eb_available != $drupal_tickets_avail)) {
+    $node_wrapper->title->set($event['event']['title']);
+    $node_wrapper->field_eb_modified->set(strtotime($event['event']['modified']));
+    $node_wrapper->field_dates->set(array(
+      'value' => $event['event']['start_date'],
+      'value2' => $event['event']['end_date'],
+    ));
+    $node_wrapper->body->set(array('value' => $event['event']['description'], 'format' => 'full_html'));
+    $node_wrapper->field_eb_tickets_available->set($event['event']['tickets'][0]['ticket']['quantity_available']);
+    $node_wrapper->field_eb_tickets_sold->set($event['event']['tickets'][0]['ticket']['quantity_sold']);
+    $node_wrapper->field_eb_tickets_remaining->set(($event['event']['tickets'][0]['ticket']['quantity_available']) - ($event['event']['tickets'][0]['ticket']['quantity_sold']));
+    //$node_wrapper->save();
+    //watchdog('Eventbrite ','Updated ' . $event['event']['title']);
+  }
+}
+
+// *******************************************************
+///
+// Test Page content to get eventbrite data
+function eventbrite_content() {
+  // Get Event IDs from existing events
+  $output = array();
+/*
+  require 'eventbrite.php';
+  $output = array();
+  $access_token = variable_get('eventbrite_access_token');
+  //$access_token = 'sd';
+  $eb_client = new Eventbrite( array('access_token' => $access_token));
+
+  try {
+    $events = $eb_client->user_list_events();
+    if (!empty($events)) {
+      drupal_set_message('Connected to Eventbrite','notice');
+    }
+  } catch ( Exception $e ) {
+      drupal_set_message('Could Not Connect to Eventbrite','warning');
+    return $output;
+  }
+*/
+
+
+
+  $access_token = variable_get('eventbrite_access_token');
+  require 'eventbrite.php';
+  $eb_client = new Eventbrite( array('access_token' => $access_token));
+  //$queue = new UniqueQueue('hd_eventbrite_event_pull');
+
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'event')
+    //->propertyCondition('status', 1)
+    ->fieldCondition('field_eb_event_id', 'value', 'NULL', '!=');
+  $results = $query->execute();
+  $current_ids = array();
+  if (isset($results['node'])) {
+     $stories = $results['node'];
+     $fields = field_info_instances('node', 'event');
+     $field_id = $fields['field_eb_event_id']['field_id'];
+     field_attach_load('node', $stories, FIELD_LOAD_CURRENT, array('field_id' => $field_id));
+     foreach ($results['node'] as $result) {
+       $current_ids[] = $result->field_eb_event_id['und'][0]['value'];
+     }
+  }
+  try {
+    $events = $eb_client->user_list_events();
+    if (!empty($events)) {
+      watchdog('Eventbrite','Connected to Eventbrite - Syncing Events');
+    }
+  } catch ( Exception $e ) {
+      watchdog('Eventbrite','Could Not Connect to Eventbrite');
+    return;
+  }
+
+    $event_list = json_decode(json_encode($events->events), true);
+    $events_to_add = array();
+    foreach($event_list as $event) {
+      $event_id = $event['event']['id'];
+      if ($event['event']['status'] == 'Live') {
+            dpm($event);
+      }
+
+      if (in_array($event_id,$current_ids)) {
+        // Update events that are already in the Drupal system
+          //DrupalQueue::get('eventbrite_update_queue')->createItem($event);
+          //dpm($event);
+        //return;
+      } else {
+         //DrupalQueue::get('eventbrite_pull_queue')->createItem($event);
+        if ($event['event']['status'] == 'Live') {
+
+          //$events_to_add[] = $event['event']['id'];
+        }
+      }
+    }
+    //return;
+return $output;
+
+}

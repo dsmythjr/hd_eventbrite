@@ -1,0 +1,6 @@
+name = HD Eventbrite Migration
+description = Custom Eventbrite Integration
+package = HD
+core = 7.x
+
+dependencies[] = unique_queue
